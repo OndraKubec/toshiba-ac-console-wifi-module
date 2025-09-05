@@ -1,27 +1,44 @@
+# main.py — start web, Modbus TCP, and CN22 UART bridge
+
 import uasyncio as asyncio
 import wifi
 import web_server
-from modbus_tcp import ModbusTCPServer, ACModel, simulate_sensors
+from modbus_tcp import ModbusTCPServer, ACModel, update_rssi
+from toshiba_cn22_driver import ToshibaCN22Driver
 
 
 async def main():
-    # Connect to wifi
+    print("[main] Connecting to Wi-Fi...")
     ip = wifi.connect()
-
-    # Start web server (non-blocking)
+    print(f"[main] Wi-Fi connected, IP: {ip}")
+    print("[main] Starting web server...")
     await web_server.start(host=ip, port=80)
+    print("[main] Web server started.")
 
-    # create fake AC model
-    model = ACModel()
+    # Model + driver
+    print("[main] Initializing ACModel and ToshibaCN22Driver...")
+    model = ACModel(driver=None)
+    driver = ToshibaCN22Driver(model)  # TX=32, RX=33 inside driver
+    model.driver = driver  # inject
+    print("[main] Model and driver initialized.")
 
-    # create and start modbus tcp server
+    # Start Modbus TCP
+    print("[main] Starting Modbus TCP server...")
     server = ModbusTCPServer(model, host=ip, port=502, unit_id=1)
     await server.start()
+    print("[main] Modbus TCP server started.")
 
-    # simulate sensors
-    asyncio.create_task(simulate_sensors(model))
+    # Bring up UART side: handshake + tasks
+    print("[main] Starting CN22 handshake...")
+    await driver.handshake()
+    print("[main] Handshake done. Starting keepalive, poll and event watch tasks...")
+    asyncio.create_task(driver.keepalive_task())
+    asyncio.create_task(driver.poll_task(every_ms=30000))
+    asyncio.create_task(driver.event_watch_task())
+    asyncio.create_task(update_rssi(model, wifi))
+    print("[main] Tasks started. Parking forever.")
 
-    # Keep the loop alive; replace with your own app tasks
+    # park forever
     await asyncio.Event().wait()
 
 

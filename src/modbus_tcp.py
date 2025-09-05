@@ -1,8 +1,15 @@
 # modbus_tconnect_fake.py
-# Fake "TConnect over UART" via Modbus TCP - MicroPython (uasyncio)
+# Modbus TCP server + ACModel wired to CN22 driver (ToshibaCN22Driver)
+
 import uasyncio as asyncio
 import struct
 import time
+
+# ---- Compatibility: MicroPython's StreamReader raises EOFError on disconnect ----
+try:
+    _IncompleteRead = asyncio.IncompleteReadError  # CPython / some ports
+except AttributeError:
+    _IncompleteRead = EOFError  # MicroPython
 
 # Modbus exception codes
 _ILLEGAL_FUNCTION = 0x01
@@ -10,7 +17,6 @@ _ILLEGAL_DATA_ADDRESS = 0x02
 _ILLEGAL_DATA_VALUE = 0x03
 _SERVER_DEVICE_FAILURE = 0x04
 
-# Value helpers
 INT16_MIN = -32768
 
 
@@ -23,64 +29,70 @@ def _s16(x):
     return x - 0x10000 if x & 0x8000 else x
 
 
-# Simple model matching TConnect's status fields
 class ACModel:
-    # enums to keep it tidy
     MODE_AUTO, MODE_COOL, MODE_HEAT, MODE_DRY, MODE_FAN = 0, 1, 2, 3, 4
     FAN_QUIET, FAN_1, FAN_2, FAN_3, FAN_4, FAN_5, FAN_AUTO = 0, 1, 2, 3, 4, 5, 6
 
-    def __init__(self):
-        # mirror to "holding" regs
-        self.state = 0  # 0=OFF, 1=ON
+    def __init__(self, driver=None):
+        self.driver = driver  # ToshibaCN22Driver injected later
+        self.state = 0
         self.mode = self.MODE_FAN
         self.fanmode = self.FAN_AUTO
-        self.swing = 0  # 0=OFF, 1=ON
-        self.setpoint_x10 = 220  # 22.0 C
-        self.roomtemp_x10 = 240  # 24.0 C
-        self.outdoor_x10 = INT16_MIN  # "-" unknown
+        self.swing = 0
+        self.setpoint_x10 = 220
+        self.roomtemp_x10 = 240
+        self.outdoor_x10 = INT16_MIN
         self.rssi_dbm = -58
 
-    # packing/unpacking holding regs 0..7
     def to_regs(self):
-        vals = [
-            self.state,
-            self.mode,
-            self.fanmode,
-            self.swing,
-            _u16(self.setpoint_x10),
-            _u16(self.roomtemp_x10),
-            _u16(self.outdoor_x10 if self.outdoor_x10 != None else INT16_MIN),
-            _u16(self.rssi_dbm),
+        return [
+            self.state,  # 0
+            self.mode,  # 1
+            self.fanmode,  # 2
+            self.swing,  # 3
+            _u16(self.setpoint_x10),  # 4
+            _u16(self.roomtemp_x10),  # 5
+            _u16(self.outdoor_x10 if self.outdoor_x10 is not None else INT16_MIN),  # 6
+            _u16(self.rssi_dbm),  # 7
         ]
-        return vals
 
     def apply_write(self, addr, vals):
-        # Only allow writes to: state, mode, fanmode, swing, setpoint
+        # Apply locally and forward to driver asynchronously
         for i, raw in enumerate(vals):
             a = addr + i
             v = _s16(raw)
-            if a == 0:  # state
+            if a == 0:  # power
                 if v not in (0, 1):
                     raise ValueError
                 self.state = v
+                if self.driver:
+                    asyncio.create_task(self.driver.set_power(v))
             elif a == 1:  # mode
                 if v not in (0, 1, 2, 3, 4):
                     raise ValueError
                 self.mode = v
-            elif a == 2:  # fanmode
+                if self.driver:
+                    asyncio.create_task(self.driver.set_mode(v))
+            elif a == 2:  # fan
                 if v not in (0, 1, 2, 3, 4, 5, 6):
                     raise ValueError
                 self.fanmode = v
+                if self.driver:
+                    asyncio.create_task(self.driver.set_fanmode(v))
             elif a == 3:  # swing
                 if v not in (0, 1):
                     raise ValueError
                 self.swing = v
-            elif a == 4:  # setpoint
-                if v < 160 or v > 300:  # 16.0°C..30.0°C
+                if self.driver:
+                    asyncio.create_task(self.driver.set_swing(v))
+            elif a == 4:  # setpoint x10
+                if v < 160 or v > 300:
                     raise ValueError
                 self.setpoint_x10 = v
+                if self.driver:
+                    asyncio.create_task(self.driver.set_setpoint_x10(v))
             else:
-                # ignore writes to read-only slots (room temp / outdoor / rssi)
+                # ignore writes to read-only slots
                 pass
 
 
@@ -96,7 +108,9 @@ class ModbusTCPServer:
 
     async def start(self):
         self._server = await asyncio.start_server(self._client, self.host, self.port)
-        print("Modbus TCP on %s:%d (UID=%d)" % (self.host, self.port, self.uid))
+        print(
+            "[modbus] Modbus TCP on %s:%d (UID=%d)" % (self.host, self.port, self.uid)
+        )
         return self._server
 
     async def stop(self):
@@ -109,7 +123,9 @@ class ModbusTCPServer:
         try:
             while True:
                 # MBAP (7 bytes)
-                hdr = await reader.readexactly(7)
+                hdr = await reader.readexactly(
+                    7
+                )  # raises EOFError on disconnect (MicroPython)
                 tid, pid, length, uid = struct.unpack(">HHHB", hdr)
                 if pid != 0:
                     await self._discard(reader, length - 1)
@@ -131,7 +147,9 @@ class ModbusTCPServer:
                     await writer.awrite(mbap + resp_pdu)
                 except OSError:
                     break
-        except (asyncio.IncompleteReadError, OSError):
+        except (_IncompleteRead, OSError):
+            print("[modbus] _IncompleteRead/OSError, closing client")
+            # Client disconnected or socket error – normal.
             pass
         finally:
             try:
@@ -141,6 +159,7 @@ class ModbusTCPServer:
 
     def _process(self, fc, data):
         regs = self.model.to_regs()
+
         # FC 03 / FC 04: read registers
         if fc in (0x03, 0x04):
             if len(data) != 4:
@@ -189,10 +208,10 @@ class ModbusTCPServer:
                 pass
 
 
-# Optional: a tiny task to “fake” changing temps/RSSI over time
+# Optional “fake” drift if you still want it while testing:
 async def simulate_sensors(model: ACModel):
     while True:
-        # drift room temp slightly toward setpoint if state=ON
+        # Drift room temp toward setpoint when ON
         rt = model.roomtemp_x10
         sp = model.setpoint_x10
         if model.state == 1:
@@ -201,7 +220,17 @@ async def simulate_sensors(model: ACModel):
             elif rt > sp:
                 rt -= 1
         model.roomtemp_x10 = rt
-        # random-ish outdoor temp placeholder
+        # Random-ish outdoor temp placeholder
         t = int(time.ticks_ms() // 1000) % 60
         model.outdoor_x10 = 50 + t  # 5.0°C .. 11.0°C
         await asyncio.sleep(1)
+
+
+# Optional Wi-Fi RSSI updater (if you have wifi.rssi())
+async def update_rssi(model: ACModel, wifi_mod):
+    while True:
+        try:
+            model.rssi_dbm = int(wifi_mod.rssi())
+        except:
+            pass
+        await asyncio.sleep(10)
