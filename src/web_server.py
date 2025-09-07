@@ -1,12 +1,17 @@
 # webserver.py
 import uasyncio as asyncio
+import config
 
-_RESPONSE_OK = b"""HTTP/1.1 200 OK\r
+_RESPONSE_OK = (
+    b"""HTTP/1.1 200 OK\r
 Connection: close\r
 Content-Type: text/plain\r
 Content-Length: 2\r
 \r
-OK"""
+OK - """
+    + config.DESCRIPTION.encode()
+    + b"\r\n"
+)
 
 
 async def _handle(reader, writer):

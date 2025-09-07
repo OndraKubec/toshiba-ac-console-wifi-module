@@ -21,10 +21,11 @@
 
 import uasyncio as asyncio
 import time
+import config
 from machine import UART, Pin
 
 # ========================= UART & TIMING =========================
-TX_PIN, RX_PIN, UART_ID = 32, 33, 1
+TX_PIN, RX_PIN, UART_ID = config.UART_TX_PIN, config.UART_RX_PIN, 1
 BAUD, BITS, PARITY, STOP = 9600, 8, 0, 1  # parity=0 => EVEN on ESP32 MicroPython
 RXBUF = 4096
 
