@@ -1,16 +1,21 @@
 # main.py — start web, Modbus TCP, and CN22 UART bridge
 
 import uasyncio as asyncio
-import wifi
 import web_server
+from wifi import WiFiManager
 from modbus_tcp import ModbusTCPServer, ACModel, update_rssi
 from toshiba_cn22_driver import ToshibaCN22Driver
 
 
 async def main():
+    wifi = WiFiManager()
     print("[main] Connecting to Wi-Fi...")
     ip = wifi.connect()
     print(f"[main] Wi-Fi connected, IP: {ip}")
+
+    # Launch background keepalive
+    asyncio.create_task(wifi.keepalive())
+
     print("[main] Starting web server...")
     await web_server.start(host=ip, port=80)
     print("[main] Web server started.")
