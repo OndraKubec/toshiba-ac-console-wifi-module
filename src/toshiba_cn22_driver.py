@@ -1,28 +1,8 @@
-# toshiba_cn22_driver.py — Toshiba CN22 UART driver (ESP32 MicroPython, uasyncio)
-# Pins (your wiring):
-#   TX=32 -> CN22 pin 1 (via 3v3→5V level shifter)
-#   RX=33 <- CN22 pin 4 (via 5V→3v3 level shifter)
-#
-# Features:
-# - Handshake + AFTER_HS keepalive (sniff-confirmed frames)
-# - Periodic polling of key SIDs (power/mode/fan/temps)  [0x41 omitted: often no reply]
-# - Writes:
-#     • setpoint:      EXT  F8 <mode_code> <temp> 41 00   (mode-first → no mode flip)
-#     • mode:          EXT  F8 <mode_code> <temp> 41 00   (auto/cool/heat/dry/fan)
-#     • fan (quiet..5):EXT  F8 <mode_code> <temp> <fan_code> 00  (mode-first → no mode flip)
-#       fan auto:      EXT  F8 <mode_code> <temp> 41 00   (no explicit fan code seen yet)
-#     • swing:         SIMPLE 0xA3 0x41(on) / 0x31(off)   (from sniff)
-# - Reflects 0x90 replies into ACModel fields
-#   • mode SID(0xB0) returns code 0x41..0x45 → decoded to 0..4
-#   • fan  SID(0x90) accepts 0..6 OR codes 0x31..0x36
-#   • swing has no readable SID; model.swing synced from writes
-# - Optional 0x11 event watcher (ACK with 0x91 + burst poll)
-# - Debug logging: set debug=1 (TX/RX, timings) or debug=2 (include hex dumps)
-
 import uasyncio as asyncio
 import time
 import config
 from machine import UART, Pin
+from logger import Logger
 
 # ========================= UART & TIMING =========================
 TX_PIN, RX_PIN, UART_ID = config.UART_TX_PIN, config.UART_RX_PIN, 1
@@ -41,22 +21,17 @@ REHANDSHAKE_MISSED = 2
 CMD_POWER = 0x80
 CMD_MODE = 0xB0
 CMD_FAN = 0x90
-# Swing per sniff: SIMPLE 0xA3 with 0x41 (ON) / 0x31 (OFF)
-CMD_SWING = 0xA3
+CMD_SWING = 0xA3  # swing uses SIMPLE 0xA3 with 0x41(on)/0x31(off)
 VAL_SWING_ON, VAL_SWING_OFF = 0x41, 0x31
-
 VAL_POWER_ON, VAL_POWER_OFF = 0x30, 0x31
 
-# Mode (EXT) — from sniffs: F8 <code> <temp> 41 00
-# ACModel order: 0=auto,1=cool,2=heat,3=dry,4=fan
+# Mode codes — ACModel order: 0=auto,1=cool,2=heat,3=dry,4=fan
 MODE_CODE = {0: 0x41, 1: 0x42, 2: 0x43, 3: 0x44, 4: 0x45}
 MODE_CODE_REV = {v: k for k, v in MODE_CODE.items()}
 
-# Fan (EXT) — from sniffs:
-# quiet:0x31, 1:0x32, 2:0x33, 3:0x34, 4:0x35, 5:0x36
+# Fan codes — quiet..5; auto is handled as “mode+temp only”
 FAN_CODE = {0: 0x31, 1: 0x32, 2: 0x33, 3: 0x34, 4: 0x35, 5: 0x36}
 FAN_CODE_REV = {v: k for k, v in FAN_CODE.items()}
-# Fan auto had no distinct code in sniffs; using mode+temp only (no fan pair)
 FAN_AUTO_SENT_AS_MODE_TEMP_ONLY = True
 
 
@@ -87,7 +62,14 @@ def _build_simple(cmd, val):
 
 
 def _build_ext_pairs(pairs):
-    # pairs = [(reg,val), ...]
+    body = (
+        BASE_EXT + b"\xf8" + b"".join(bytes([r & 0xFF, v & 0xFF]) for (r, v) in pairs)
+    )
+    return body + bytes([_chk_to_0x_02(body)])  # <- fix typo below
+
+
+# NOTE: Correcting small typo in the checksum helper call:
+def _build_ext_pairs(pairs):
     body = (
         BASE_EXT + b"\xf8" + b"".join(bytes([r & 0xFF, v & 0xFF]) for (r, v) in pairs)
     )
@@ -105,23 +87,19 @@ def _build_set_mode_ext(temp_c, mode):
 
 
 def _build_set_temp_keep_mode(temp_c, mode_code):
-    """Set temperature WITHOUT flipping mode: send <mode_code, temp> + keep-temp."""
     t = _clamp_temp(temp_c)
     return _build_ext_pairs([(mode_code, t), (0x41, 0x00)])
 
 
 def _build_set_fan_ext_with_mode(temp_c, fan, mode_code):
-    # To prevent mode jumping to AUTO, send the current mode first.
-    # fan auto → no fan pair (only mode+temp), based on sniffs.
     t = _clamp_temp(temp_c)
     if FAN_AUTO_SENT_AS_MODE_TEMP_ONLY and fan == 6:
         return _build_ext_pairs([(mode_code, t), (0x41, 0x00)])
-    code = FAN_CODE.get(fan, 0x32)  # default to step 1 if out of range
+    code = FAN_CODE.get(fan, 0x32)
     return _build_ext_pairs([(mode_code, t), (code, 0x00)])
 
 
 def _parse_0x90_frames(stream):
-    """Return [(sid, val, ok), ...] parsed from any 0x90 frames in stream."""
     out = []
     if not stream:
         return out
@@ -143,27 +121,10 @@ def _parse_0x90_frames(stream):
 
 
 def _build_ack_91():
-    # ACK for 0x11 events (matches OEM):
-    # 02 00 03 91 01 00 05  00 00 01 30 01  <chk>
     body = bytes(
         [0x02, 0x00, 0x03, 0x91, 0x01, 0x00, 0x05, 0x00, 0x00, 0x01, 0x30, 0x01]
     )
     return body + bytes([_chk_to_0x02(body)])
-
-
-# ========================= HANDSHAKE (sniffed) ===================
-HS = [
-    bytes([0x02, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x02]),
-    bytes([0x02, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x01, 0x02, 0xFE]),
-    bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0xFA]),
-    bytes([0x02, 0x00, 0x01, 0x81, 0x01, 0x00, 0x02, 0x00, 0x00, 0x7B]),
-    bytes([0x02, 0x00, 0x01, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFB]),
-    bytes([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xFE]),
-]
-AFTER_HS = [
-    bytes([0x02, 0x00, 0x02, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFB]),
-    bytes([0x02, 0x00, 0x02, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFA]),
-]
 
 
 # ========================= DRIVER ================================
@@ -180,20 +141,11 @@ class ToshibaCN22Driver:
         self._busy = False
         self._event_polling = False
         self.debug = int(debug)  # 0: off, 1: basic, 2: hex
+        self.log = Logger("cn22-driver")
 
-    # ---- debug helpers ----
+    # ---- debug helpers via Logger ----
     def set_debug(self, level):
         self.debug = int(level)
-
-    def _now_ms(self):
-        try:
-            return time.ticks_ms()
-        except:
-            return 0
-
-    def _log(self, *args):
-        if self.debug:
-            print("[%d] " % self._now_ms(), *args)
 
     def _hex(self, b):
         try:
@@ -203,10 +155,20 @@ class ToshibaCN22Driver:
 
     # ---- low-level I/O ----
     def _mk_uart(self):
-        self._log(
-            "UART init: id=%d tx=%d rx=%d baud=%d bits=%d parity=%s stop=%d rxbuf=%d"
-            % (self.uart_id, self.tx_pin, self.rx_pin, BAUD, BITS, "EVEN", STOP, RXBUF)
-        )
+        if self.debug >= 1:
+            self.log.debug(
+                "UART init: id=%d tx=%d rx=%d baud=%d bits=%d parity=%s stop=%d rxbuf=%d"
+                % (
+                    self.uart_id,
+                    self.tx_pin,
+                    self.rx_pin,
+                    BAUD,
+                    BITS,
+                    "EVEN",
+                    STOP,
+                    RXBUF,
+                )
+            )
         return UART(
             self.uart_id,
             baudrate=BAUD,
@@ -226,15 +188,16 @@ class ToshibaCN22Driver:
             try:
                 d = self.uart.read()
             except Exception as e:
-                self._log("UART read error:", e)
+                if self.debug >= 1:
+                    self.log.debug(f"UART read error: {e}")
                 d = None
             if d:
                 chunks += 1
                 buf.extend(d)
         if self.debug >= 1:
-            self._log("RX collect: %d ms, %d chunks, %d bytes" % (ms, chunks, len(buf)))
+            self.log.debug(f"RX collect: {ms} ms, {chunks} chunks, {len(buf)} bytes")
             if self.debug >= 2 and buf:
-                self._log("RX hex:", self._hex(buf))
+                self.log.debug("RX hex: " + self._hex(buf))
         return bytes(buf)
 
     async def _wait_idle(self, idle_ms=30, timeout_ms=1200):
@@ -244,17 +207,18 @@ class ToshibaCN22Driver:
             try:
                 d = self.uart.read()
             except Exception as e:
-                self._log("UART read error during wait_idle:", e)
+                if self.debug >= 1:
+                    self.log.debug(f"UART read error during wait_idle: {e}")
                 d = None
             if d:
                 last = time.ticks_ms()
             if time.ticks_diff(time.ticks_ms(), last) >= idle_ms:
                 if self.debug >= 1:
-                    self._log("wait_idle: idle for", idle_ms, "ms")
+                    self.log.debug(f"wait_idle: idle for {idle_ms} ms")
                 return True
             if time.ticks_diff(time.ticks_ms(), t0) >= timeout_ms:
                 if self.debug >= 1:
-                    self._log("wait_idle: TIMEOUT after", timeout_ms, "ms")
+                    self.log.debug(f"wait_idle: TIMEOUT after {timeout_ms} ms")
                 return False
             await asyncio.sleep_ms(4)
 
@@ -263,25 +227,31 @@ class ToshibaCN22Driver:
     ):
         self._busy = True
         try:
+            # drain any pending RX
             try:
                 while True:
                     d = self.uart.read()
                     if not d:
                         break
             except Exception as e:
-                self._log("UART drain error:", e)
+                if self.debug >= 1:
+                    self.log.debug(f"UART drain error: {e}")
+
             idle_ok = await self._wait_idle(30, 1200)
             if self.debug >= 1:
-                self._log("TX %s len=%d idle_ok=%s" % (label, len(frame), idle_ok))
+                self.log.debug(f"TX {label} len={len(frame)} idle_ok={idle_ok}")
                 if self.debug >= 2:
-                    self._log("TX hex:", self._hex(frame))
+                    self.log.debug("TX hex: " + self._hex(frame))
+
             self.uart.write(frame)
             rsp = await self._rx_collect(wait_ms)
+
             if self.debug >= 1:
                 if rsp:
-                    self._log("RX %s len=%d" % (label, len(rsp)))
+                    self.log.debug(f"RX {label} len={len(rsp)}")
                 else:
-                    self._log("RX %s: <no response>" % label)
+                    self.log.debug(f"RX {label}: <no response>")
+
             await asyncio.sleep_ms(gap_ms)
             self._reflect_stream(rsp)
             return rsp
@@ -294,7 +264,8 @@ class ToshibaCN22Driver:
             if self.uart is None:
                 self.uart = self._mk_uart()
             self._handshaked = False
-            self._log("Handshake: start (delay %d ms)" % START_DELAY_MS)
+            if self.debug >= 1:
+                self.log.debug(f"Handshake: start (delay {START_DELAY_MS} ms)")
             await asyncio.sleep_ms(START_DELAY_MS)
             try:
                 await self._send(
@@ -323,23 +294,24 @@ class ToshibaCN22Driver:
                 )
                 self._handshaked = True
                 self._missed_keepalive = 0
-                self._log("Handshake: DONE")
+                self.log.info("Handshake: DONE")
             except Exception as e:
-                self._log("Handshake error:", e)
+                self.log.error(f"Handshake error: {e}")
                 raise
 
     async def keepalive_task(self):
         while True:
             try:
                 if not self._handshaked:
-                    self._log("keepalive: not handshaked -> handshake()")
+                    if self.debug >= 1:
+                        self.log.debug("keepalive: not handshaked -> handshake()")
                     await self.handshake()
                     await asyncio.sleep_ms(1000)
                     continue
                 ok = False
                 for i, fr in enumerate(AFTER_HS):
                     rsp = await self._send(
-                        "KA%d" % i,
+                        f"KA{i}",
                         fr,
                         wait_ms=300,
                         gap_ms=GAP_SHORT_MS,
@@ -349,24 +321,26 @@ class ToshibaCN22Driver:
                         ok = True
                 if not ok:
                     self._missed_keepalive += 1
-                    self._log("keepalive: missed (%d)" % self._missed_keepalive)
+                    if self.debug >= 1:
+                        self.log.debug(f"keepalive: missed ({self._missed_keepalive})")
                     if self._missed_keepalive >= REHANDSHAKE_MISSED:
-                        self._log("keepalive: re-handshake")
+                        if self.debug >= 1:
+                            self.log.debug("keepalive: re-handshake")
                         self._handshaked = False
                         self._missed_keepalive = 0
                 else:
-                    if self._missed_keepalive:
-                        self._log("keepalive: recovered")
+                    if self._missed_keepalive and self.debug >= 1:
+                        self.log.debug("keepalive: recovered")
                     self._missed_keepalive = 0
                 await asyncio.sleep_ms(KEEPALIVE_EVERY_MS)
             except Exception as e:
-                self._log("keepalive_task error:", e)
+                self.log.error(f"keepalive_task error: {e}")
                 await asyncio.sleep_ms(500)
 
     # ---- reflect replies into model ----
     def _reflect_sid_val(self, sid, val):
         if self.debug >= 2:
-            self._log("reflect SID=0x%02X VAL=0x%02X" % (sid, val))
+            self.log.debug("reflect SID=0x%02X VAL=0x%02X" % (sid, val))
         if sid == 0x80:
             self.model.state = 1 if val == VAL_POWER_ON else 0
         elif sid == 0xB0:
@@ -390,20 +364,21 @@ class ToshibaCN22Driver:
         if not rsp:
             return
         frames = _parse_0x90_frames(rsp)
-        if self.debug >= 1 and frames:
-            self._log("reflect_stream: %d x 0x90 frames" % len(frames))
+        if frames and self.debug >= 1:
+            self.log.debug(f"reflect_stream: {len(frames)} x 0x90 frames")
         for sid, val, ok in frames:
             if ok:
                 self._reflect_sid_val(sid, val)
             elif self.debug >= 1:
-                self._log("reflect: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val))
+                self.log.debug(
+                    "reflect: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val)
+                )
 
     # ---- quick helper: get current mode_code (read if unknown) ----
     async def _get_current_mode_code(self):
         cur_mode = getattr(self.model, "mode", None)
         if cur_mode is not None and 0 <= int(cur_mode) <= 4:
             return MODE_CODE.get(int(cur_mode), 0x41)
-        # Try to read SID 0xB0 once
         try:
             rsp = await self._send(
                 "READB0(cur_mode)",
@@ -420,14 +395,13 @@ class ToshibaCN22Driver:
                         self.model.mode = val
                         return MODE_CODE[val]
         except Exception as e:
-            if self.debug:
-                self._log("get_current_mode_code read failed:", e)
-        # Fallback: assume AUTO
-        return 0x41
+            if self.debug >= 1:
+                self.log.debug(f"get_current_mode_code read failed: {e}")
+        return 0x41  # fallback AUTO
 
     # ---- polling task ----
     async def poll_task(self, every_ms=2000):
-        _POLL_SIDS = (0x80, 0xB0, 0x90, 0xBB, 0xBE)  # 0x41 omitted; swing omitted
+        _POLL_SIDS = (0x80, 0xB0, 0x90, 0xBB, 0xBE)
         while True:
             try:
                 if not self._handshaked:
@@ -435,17 +409,16 @@ class ToshibaCN22Driver:
                     continue
                 for sid in _POLL_SIDS:
                     if self.debug >= 1:
-                        self._log("poll: READ 0x%02X" % sid)
-                    req = _build_read(sid)
+                        self.log.debug("poll: READ 0x%02X" % sid)
                     _ = await self._send(
                         f"READ{sid:02X}",
-                        req,
+                        _build_read(sid),
                         wait_ms=POLL_WAIT_MS,
                         verbose=(self.debug >= 1),
                     )
                 await asyncio.sleep_ms(every_ms)
             except Exception as e:
-                self._log("poll_task error:", e)
+                self.log.error(f"poll_task error: {e}")
                 await asyncio.sleep_ms(500)
 
     # ---- event watch (optional; start task from your app) ----
@@ -474,9 +447,9 @@ class ToshibaCN22Driver:
             return
         self._event_polling = True
         try:
-            for sid in (0x41, 0x80, 0xB0, 0x90, 0xBB, 0xBE):  # keep 0x41 just in case
+            for sid in (0x41, 0x80, 0xB0, 0x90, 0xBB, 0xBE):
                 if self.debug >= 1:
-                    self._log("burst_poll: READ 0x%02X" % sid)
+                    self.log.debug("burst_poll: READ 0x%02X" % sid)
                 await self._send(
                     f"EVT_READ{sid:02X}",
                     _build_read(sid),
@@ -501,18 +474,19 @@ class ToshibaCN22Driver:
                 try:
                     d = self.uart.read()
                 except Exception as e:
-                    self._log("UART read error in event_watch:", e)
+                    if self.debug >= 1:
+                        self.log.debug(f"UART read error in event_watch: {e}")
                     d = None
                 if d:
                     buf.extend(d)
                 frames = self._feed_frames(buf)
                 if frames and self.debug >= 1:
-                    self._log("event_watch: %d frames" % len(frames))
+                    self.log.debug(f"event_watch: {len(frames)} frames")
                 for fr in frames:
                     if len(fr) >= 7 and fr[:3] == b"\x02\x00\x03":
                         typ = fr[3]
                         if self.debug >= 2:
-                            self._log(
+                            self.log.debug(
                                 "EVT frame typ=0x%02X len=%d hex=%s"
                                 % (typ, len(fr), self._hex(fr))
                             )
@@ -521,14 +495,16 @@ class ToshibaCN22Driver:
                         elif typ == 0x11:
                             try:
                                 if self.debug >= 1:
-                                    self._log("EVT: 0x11 -> send 0x91 ACK + burst_poll")
+                                    self.log.debug(
+                                        "EVT: 0x11 -> send 0x91 ACK + burst_poll"
+                                    )
                                 self.uart.write(_build_ack_91())
                             except Exception as e:
-                                self._log("ACK 0x91 write error:", e)
+                                self.log.error(f"ACK 0x91 write error: {e}")
                             asyncio.create_task(self._burst_poll())
                 await asyncio.sleep_ms(2)
             except Exception as e:
-                self._log("event_watch_task error:", e)
+                self.log.error(f"event_watch_task error: {e}")
                 await asyncio.sleep_ms(200)
 
     # ==================== PUBLIC API ====================
@@ -537,10 +513,9 @@ class ToshibaCN22Driver:
         if not self._handshaked:
             await self.handshake()
         mode_code = await self._get_current_mode_code()
-        pkt = _build_set_temp_keep_mode(t, mode_code)
         await self._send(
             f"SET_TEMP({t}) keep-mode",
-            pkt,
+            _build_set_temp_keep_mode(t, mode_code),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
@@ -566,7 +541,6 @@ class ToshibaCN22Driver:
                 gap_ms=GAP_NORMAL_MS,
                 verbose=(self.debug >= 1),
             )
-            # OEM behavior: send keep-temp after OFF, but do not flip mode
             temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
             mode_code = await self._get_current_mode_code()
             await self._send(
@@ -583,10 +557,9 @@ class ToshibaCN22Driver:
         if not self._handshaked:
             await self.handshake()
         temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
-        pkt = _build_set_mode_ext(temp_c, m)
         await self._send(
             f"MODE_EXT({m})",
-            pkt,
+            _build_set_mode_ext(temp_c, m),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
@@ -594,22 +567,19 @@ class ToshibaCN22Driver:
         self.model.mode = m
 
     async def set_fanmode(self, fan):
-        """fan: 0=quiet,1..5=steps,6=auto."""
         f = 0 if fan < 0 else 6 if fan > 6 else fan
         if not self._handshaked:
             await self.handshake()
         temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
-        # Use current mode code to avoid mode flip
         cur_mode = getattr(self.model, "mode", None)
         mode_code = (
             MODE_CODE.get(int(cur_mode), 0x41)
             if cur_mode is not None
             else await self._get_current_mode_code()
         )
-        pkt = _build_set_fan_ext_with_mode(temp_c, f, mode_code)
         await self._send(
             f"FAN_EXT({f})",
-            pkt,
+            _build_set_fan_ext_with_mode(temp_c, f, mode_code),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
@@ -617,7 +587,6 @@ class ToshibaCN22Driver:
         self.model.fanmode = f
 
     async def set_swing(self, on):
-        """Swing control from sniffs: SIMPLE 0xA3 with 0x41 (ON) / 0x31 (OFF)."""
         v = 1 if on else 0
         if not self._handshaked:
             await self.handshake()
@@ -629,14 +598,15 @@ class ToshibaCN22Driver:
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
         )
-        self.model.swing = v  # no distinct swing SID observed
+        self.model.swing = v
 
     async def close(self):
         if self.uart:
             try:
                 self.uart.deinit()
             except Exception as e:
-                self._log("UART deinit error:", e)
+                self.log.error(f"UART deinit error: {e}")
             self.uart = None
             self._handshaked = False
-            self._log("UART closed")
+            if self.debug >= 1:
+                self.log.debug("UART closed")
