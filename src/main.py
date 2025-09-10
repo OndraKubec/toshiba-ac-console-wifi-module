@@ -12,11 +12,11 @@ async def main():
 
     # Wi-Fi (WiFiManager logs its own steps)
     wifi = WiFiManager()
-    _ = wifi.connect()
+    ip = wifi.connect()
     asyncio.create_task(wifi.keepalive())
 
     # HTTP server (logs inside WebServer)
-    web = WebServer(host="0.0.0.0", port=80)
+    web = WebServer(host=ip, port=80)
     await web.start()
 
     # Model + driver (driver logs handshake/traffic when debug enabled)
@@ -25,7 +25,7 @@ async def main():
     model.driver = driver
 
     # Modbus TCP (bind all interfaces to survive DHCP IP changes)
-    mbs = ModbusTCPServer(model, host="0.0.0.0", port=502, unit_id=1)
+    mbs = ModbusTCPServer(model, host=ip, port=502, unit_id=1)
     await mbs.start()
 
     # RSSI updater (simple background task)
