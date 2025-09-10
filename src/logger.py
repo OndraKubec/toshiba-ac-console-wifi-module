@@ -24,9 +24,10 @@ class Logger:
         sec = ms // 1000
         ms = ms % 1000
         uptime = f"{sec:6}.{ms:03d}s"
-        level_str = f"[{level_name}]".ljust(9)
-        name_str = f"{self.name:<10.10}"
-        print(f"{uptime} {level_str} {name_str}: {msg}")
+        level_str = f"[{level_name}]"
+        level_str = "%-9s" % level_str
+        name_str = f"{self.name:<12.12}"
+        print(f"{uptime} {level_str} {name_str} – {msg}")
 
     def debug(self, msg: str):
         self._log("DEBUG", msg)

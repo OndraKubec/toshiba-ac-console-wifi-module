@@ -17,6 +17,20 @@ GAP_NORMAL_MS = 60
 KEEPALIVE_EVERY_MS = 60000
 REHANDSHAKE_MISSED = 2
 
+# ========================= HANDSHAKE (sniffed) ===================
+HS = [
+    bytes([0x02, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x02]),
+    bytes([0x02, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x01, 0x02, 0xFE]),
+    bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0xFA]),
+    bytes([0x02, 0x00, 0x01, 0x81, 0x01, 0x00, 0x02, 0x00, 0x00, 0x7B]),
+    bytes([0x02, 0x00, 0x01, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFB]),
+    bytes([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xFE]),
+]
+AFTER_HS = [
+    bytes([0x02, 0x00, 0x02, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFB]),
+    bytes([0x02, 0x00, 0x02, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0xFA]),
+]
+
 # ========================= COMMAND IDS / MAPS ====================
 CMD_POWER = 0x80
 CMD_MODE = 0xB0
@@ -61,14 +75,6 @@ def _build_simple(cmd, val):
     return body + bytes([_chk_to_0x02(body)])
 
 
-def _build_ext_pairs(pairs):
-    body = (
-        BASE_EXT + b"\xf8" + b"".join(bytes([r & 0xFF, v & 0xFF]) for (r, v) in pairs)
-    )
-    return body + bytes([_chk_to_0x_02(body)])  # <- fix typo below
-
-
-# NOTE: Correcting small typo in the checksum helper call:
 def _build_ext_pairs(pairs):
     body = (
         BASE_EXT + b"\xf8" + b"".join(bytes([r & 0xFF, v & 0xFF]) for (r, v) in pairs)
@@ -259,45 +265,78 @@ class ToshibaCN22Driver:
             self._busy = False
 
     # ---- session maintenance ----
-    async def handshake(self):
+    async def _handshake_once(self, per_step_retries=2):
+        """Run one handshake sequence. Returns (any_reply: bool, missed_labels: list[str])."""
+        steps = [
+            ("HS0", HS[0], GAP_NORMAL_MS),
+            ("HS1", HS[1], GAP_SHORT_MS),
+            ("HS2", HS[2], GAP_NORMAL_MS),
+            ("HS3", HS[3], GAP_SHORT_MS),
+            ("HS4", HS[4], GAP_SHORT_MS),
+            ("HS5", HS[5], GAP_NORMAL_MS),
+            ("AF0", AFTER_HS[0], GAP_SHORT_MS),
+            ("AF1", AFTER_HS[1], GAP_NORMAL_MS),
+        ]
+        any_reply = False
+        missed = []
+        for label, frame, gap in steps:
+            rsp = None
+            for _ in range(per_step_retries):
+                rsp = await self._send(
+                    label,
+                    frame,
+                    wait_ms=WAIT_RX_MS,
+                    gap_ms=gap,
+                    verbose=(self.debug >= 1),
+                )
+                if rsp:
+                    any_reply = True
+                    break
+                await asyncio.sleep_ms(80)  # small spacing between retries
+            if not rsp:
+                missed.append(label)
+        return any_reply, missed
+
+    async def handshake(
+        self, base_backoff_ms=500, max_backoff_ms=8000, per_step_retries=2
+    ):
+        """Handshake with repeats + exponential backoff. Never 'fail hard'."""
         async with self._lock:
             if self.uart is None:
                 self.uart = self._mk_uart()
             self._handshaked = False
+
             if self.debug >= 1:
                 self.log.debug(f"Handshake: start (delay {START_DELAY_MS} ms)")
             await asyncio.sleep_ms(START_DELAY_MS)
-            try:
-                await self._send(
-                    "HS0", HS[0], gap_ms=GAP_NORMAL_MS, verbose=(self.debug >= 1)
+
+            backoff = base_backoff_ms
+            attempt = 0
+            while True:
+                attempt += 1
+                if self.debug >= 1:
+                    self.log.debug(f"Handshake attempt {attempt}")
+                any_reply, missed = await self._handshake_once(
+                    per_step_retries=per_step_retries
                 )
-                await self._send(
-                    "HS1", HS[1], gap_ms=GAP_SHORT_MS, verbose=(self.debug >= 1)
+
+                if any_reply:
+                    self._handshaked = True
+                    self._missed_keepalive = 0
+                    if missed:
+                        self.log.warning(
+                            "Handshake: no response for steps: " + ",".join(missed)
+                        )
+                    self.log.info("Handshake: DONE")
+                    return
+
+                # No replies at all → backoff and try again
+                self.log.warning(
+                    f"Handshake: no device response (attempt {attempt}) "
+                    f"→ retrying in {backoff} ms"
                 )
-                await self._send(
-                    "HS2", HS[2], gap_ms=GAP_NORMAL_MS, verbose=(self.debug >= 1)
-                )
-                await self._send(
-                    "HS3", HS[3], gap_ms=GAP_SHORT_MS, verbose=(self.debug >= 1)
-                )
-                await self._send(
-                    "HS4", HS[4], gap_ms=GAP_SHORT_MS, verbose=(self.debug >= 1)
-                )
-                await self._send(
-                    "HS5", HS[5], gap_ms=GAP_NORMAL_MS, verbose=(self.debug >= 1)
-                )
-                await self._send(
-                    "AF0", AFTER_HS[0], gap_ms=GAP_SHORT_MS, verbose=(self.debug >= 1)
-                )
-                await self._send(
-                    "AF1", AFTER_HS[1], gap_ms=GAP_NORMAL_MS, verbose=(self.debug >= 1)
-                )
-                self._handshaked = True
-                self._missed_keepalive = 0
-                self.log.info("Handshake: DONE")
-            except Exception as e:
-                self.log.error(f"Handshake error: {e}")
-                raise
+                await asyncio.sleep_ms(backoff)
+                backoff = min(backoff * 2, max_backoff_ms)
 
     async def keepalive_task(self):
         while True:

@@ -1,7 +1,8 @@
 import uasyncio as asyncio
 from web_server import WebServer
 from wifi import WiFiManager
-from modbus_tcp import ModbusTCPServer, ACModel, update_rssi
+from ac_model import ACModel, rssi_task
+from modbus_tcp import ModbusTCPServer
 from toshiba_cn22_driver import ToshibaCN22Driver
 from logger import Logger
 
@@ -27,14 +28,14 @@ async def main():
     mbs = ModbusTCPServer(model, host="0.0.0.0", port=502, unit_id=1)
     await mbs.start()
 
+    # RSSI updater (simple background task)
+    asyncio.create_task(rssi_task(model, wifi))
+
     # CN22 handshake + background tasks
     await driver.handshake()
     asyncio.create_task(driver.keepalive_task())
     asyncio.create_task(driver.poll_task(every_ms=30000))
     asyncio.create_task(driver.event_watch_task())
-
-    # RSSI updater (simple background task)
-    asyncio.create_task(update_rssi(model, wifi))
 
     log.info("System up. Parking forever.")
     await asyncio.Event().wait()

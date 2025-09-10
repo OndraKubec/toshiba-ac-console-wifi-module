@@ -49,7 +49,7 @@ class WebServer:
             return self._server
 
         self._server = await asyncio.start_server(self._handle, self.host, self.port)
-        self.log.info(f"HTTP server on http://{self.host}:{self.port} (returns 'OK')")
+        self.log.info(f"HTTP server on http://{self.host}:{self.port}")
         return self._server
 
     async def stop(self):
