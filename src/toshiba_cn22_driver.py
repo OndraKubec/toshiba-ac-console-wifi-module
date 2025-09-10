@@ -135,7 +135,7 @@ def _build_ack_91():
 
 # ========================= DRIVER ================================
 class ToshibaCN22Driver:
-    def __init__(self, model, tx_pin=TX_PIN, rx_pin=RX_PIN, uart_id=UART_ID, debug=0):
+    def __init__(self, model, tx_pin=TX_PIN, rx_pin=RX_PIN, uart_id=UART_ID, debug=2):
         self.model = model
         self.tx_pin = tx_pin
         self.rx_pin = rx_pin

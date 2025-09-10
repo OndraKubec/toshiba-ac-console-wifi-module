@@ -21,7 +21,7 @@ async def main():
 
     # Model + driver (driver logs handshake/traffic when debug enabled)
     model = ACModel(driver=None)
-    driver = ToshibaCN22Driver(model)  # set driver.debug=1/2 for more logs
+    driver = ToshibaCN22Driver(model, debug=1)
     model.driver = driver
 
     # Modbus TCP (bind all interfaces to survive DHCP IP changes)
