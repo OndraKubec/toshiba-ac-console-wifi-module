@@ -1,4 +1,4 @@
-# toshiba-ac-console-wifi-module
+# Toshiba AC Console Wifi Module
 
 Simple MicroPython bridge to control Toshiba CN22 indoor units via a Wi‑Fi connected ESP32.
 
@@ -6,6 +6,10 @@ This repo contains:
 
 -   `src/` — MicroPython application (web server, Modbus TCP server, CN22 UART driver)
 -   `src/lib/` — bundled MicroPython typing stubs and helper modules (no external mip install required)
+
+## Flashing MicroPython
+
+You can use prebuild script for flashing MicroPython and copy source files onto device.
 
 ## Quick device commands
 
