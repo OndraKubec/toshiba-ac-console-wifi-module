@@ -34,7 +34,7 @@ async def main():
     # CN22 handshake + background tasks
     await driver.handshake()
     asyncio.create_task(driver.keepalive_task())
-    asyncio.create_task(driver.poll_task(every_ms=30000))
+    asyncio.create_task(driver.poll_task(every_ms=15000))
     asyncio.create_task(driver.event_watch_task())
 
     log.info("System up. Parking forever.")
