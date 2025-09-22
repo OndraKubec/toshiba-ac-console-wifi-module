@@ -1,6 +1,6 @@
 # Toshiba AC Console Wifi Module
 
-Simple MicroPython bridge to control Toshiba CN22 indoor units via a Wi‑Fi connected ESP32.
+ESP32 bridge for controlling Toshiba control units over CN22 connector using Modbus TCP server.
 
 This repo contains:
 
@@ -18,7 +18,7 @@ You can use prebuild script for flashing MicroPython and copy source files onto 
 bash tools/flash_and_upload.sh
 ```
 
-## Quick device commands
+## Quick device commands (for development)
 
 Copy and run the CN22 write probe on the device (copies file then runs it in the REPL):
 
@@ -49,7 +49,7 @@ mpremote connect auto cp -r ./src/* : + reset + repl
 This small host-side script connects to the Modbus TCP server running on the ESP32 and
 can read the device status or write single registers (power, mode, fan, swing, setpoint).
 
-Quick description:
+Description:
 
 -   Reads 8 registers by default: state, mode, fanmode, swing, setpoint_x10, roomtemp_x10, outdoort_x10, rssi_dbm.
 -   Temperatures are reported as tenths of °C (e.g. 220 => 22.0 °C). Signed values are handled.
