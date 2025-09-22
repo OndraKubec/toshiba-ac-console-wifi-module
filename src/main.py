@@ -16,7 +16,7 @@ async def main():
     asyncio.create_task(wifi.keepalive())
 
     # HTTP server (logs inside WebServer)
-    web = WebServer(host=ip, port=80)
+    web = WebServer(host="0.0.0.0", port=80)
     await web.start()
 
     # Wait for the console unit to get ready
@@ -34,7 +34,7 @@ async def main():
     await asyncio.sleep(10)
 
     # Modbus TCP (bind all interfaces to survive DHCP IP changes)
-    mbs = ModbusTCPServer(model, host=ip, port=502, unit_id=1)
+    mbs = ModbusTCPServer(model, host="0.0.0.0", port=502, unit_id=1)
     await mbs.start()
 
     #  Background tasks
