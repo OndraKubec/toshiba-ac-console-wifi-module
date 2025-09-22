@@ -6,10 +6,17 @@ This repo contains:
 
 -   `src/` — MicroPython application (web server, Modbus TCP server, CN22 UART driver)
 -   `src/lib/` — bundled MicroPython typing stubs and helper modules (no external mip install required)
+-   `docs/` - additional files like schematics
+-   `firmware/` - MicroPython binaries used on devices for this project
+-   `tools/` - support tools to be run on developer computer or device it self
 
 ## Flashing MicroPython
 
 You can use prebuild script for flashing MicroPython and copy source files onto device.
+
+```bash
+bash tools/flash_and_upload.sh
+```
 
 ## Quick device commands
 
@@ -31,10 +38,10 @@ Remove all files from the connected device filesystem (use with caution):
 mpremote connect auto fs rm -rv -rv :/
 ```
 
-Copy the whole `src/` tree to the connected device:
+Copy the whole `src/` tree to the connected device, reset the device and enter repl:
 
 ```bash
-mpremote connect auto cp -r ./src/* :
+mpremote connect auto cp -r ./src/* : + reset + repl
 ```
 
 ## Modbus helper tool (`tools/modbus_tool.py`)
@@ -68,33 +75,33 @@ Write function semantics:
 -   `swing`: 0 or 1.
 -   `setpoint`: temperature in °C (float allowed) — script converts to tenths and writes integer.
 
-## Examples (copy-paste ready)
+### Examples (copy-paste ready)
 
-# Read status once (replace <MODBUS_IP> with your device IP)
+#### Read status once (replace <MODBUS_IP> with your device IP)
 
 ```bash
 python tools/modbus_tool.py <MODBUS_IP> --once
 ```
 
-# Poll status every 5s (replace <MODBUS_IP> with your device IP)
+#### Poll status every 5s (replace <MODBUS_IP> with your device IP)
 
 ```bash
 python tools/modbus_tool.py <MODBUS_IP> --interval 5.0
 ```
 
-# Write mode = HEAT (2) (replace <MODBUS_IP> with your device IP)
+#### Write mode = HEAT (2) (replace <MODBUS_IP> with your device IP)
 
 ```bash
 python tools/modbus_tool.py <MODBUS_IP> --write-func mode --value 2
 ```
 
-# Set setpoint to 22.0 °C (replace <MODBUS_IP> with your device IP)
+#### Set setpoint to 22.0 °C (replace <MODBUS_IP> with your device IP)
 
 ```bash
 python tools/modbus_tool.py <MODBUS_IP> --write-func setpoint --value 22.0
 ```
 
-# Turn power off (replace <MODBUS_IP> with your device IP)
+#### Turn power off (replace <MODBUS_IP> with your device IP)
 
 ```bash
 python tools/modbus_tool.py <MODBUS_IP> --write-func state --value 0
