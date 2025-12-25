@@ -16,6 +16,8 @@ GAP_SHORT_MS = 20
 GAP_NORMAL_MS = 60
 KEEPALIVE_EVERY_MS = 60000
 REHANDSHAKE_MISSED = 2
+NO_RESPONSE_RECOVER = 2
+NO_RESPONSE_RECOVER_DELAY_MS = 2000
 
 # ========================= HANDSHAKE (sniffed) ===================
 HS = [
@@ -36,8 +38,18 @@ CMD_POWER = 0x80
 CMD_MODE = 0xB0
 CMD_FAN = 0x90
 CMD_SWING = 0xA3  # swing uses SIMPLE 0xA3 with 0x41(on)/0x31(off)
+CMD_P_SELECT = 0x87  # p-select uses SIMPLE 0x87 with percentage value
 VAL_SWING_ON, VAL_SWING_OFF = 0x41, 0x31
 VAL_POWER_ON, VAL_POWER_OFF = 0x30, 0x31
+VAL_OTHER_OFF = 0x00  # F8 "other" byte (extra features from OEM app)
+VAL_OTHER_HI_POWER = 0x01
+VAL_OTHER_OUTDOOR_SILENT_ON = 0x02
+VAL_OTHER_ECO = 0x03
+VAL_OTHER_8DEG = 0x04
+VAL_OTHER_FLOOR = 0x06
+VAL_OTHER_OUTDOOR_SILENT_MID = 0x0A
+VAL_OTHER_HEAT_EXCHANGE_ON = 0x20
+VAL_OTHER_HEAT_EXCHANGE_MID = 0x30
 
 # Mode codes — ACModel order: 0=auto,1=cool,2=heat,3=dry,4=fan
 MODE_CODE = {0: 0x41, 1: 0x42, 2: 0x43, 3: 0x44, 4: 0x45}
@@ -46,8 +58,6 @@ MODE_CODE_REV = {v: k for k, v in MODE_CODE.items()}
 # Fan codes — quiet..5; auto is handled as “mode+temp only”
 FAN_CODE = {0: 0x31, 1: 0x32, 2: 0x33, 3: 0x34, 4: 0x35, 5: 0x36}
 FAN_CODE_REV = {v: k for k, v in FAN_CODE.items()}
-FAN_AUTO_SENT_AS_MODE_TEMP_ONLY = True
-
 
 # ========================= PROTOCOL HELPERS ======================
 def _chk_to_0x02(d):
@@ -83,26 +93,20 @@ def _build_ext_pairs(pairs):
 
 
 def _clamp_temp(t):
-    return 16 if t < 16 else 30 if t > 30 else t
+    return 20 if t < 20 else 30 if t > 30 else t
 
 
-def _build_set_mode_ext(temp_c, mode):
+def _fan_code_or_auto(fan):
+    if fan == 6:
+        return 0x41
+    return FAN_CODE.get(fan, 0x32)
+
+
+def _build_set_all_ext(temp_c, mode, fan, other=0x00):
     code = MODE_CODE.get(mode, 0x41)
     t = _clamp_temp(temp_c)
-    return _build_ext_pairs([(code, t), (0x41, 0x00)])
-
-
-def _build_set_temp_keep_mode(temp_c, mode_code):
-    t = _clamp_temp(temp_c)
-    return _build_ext_pairs([(mode_code, t), (0x41, 0x00)])
-
-
-def _build_set_fan_ext_with_mode(temp_c, fan, mode_code):
-    t = _clamp_temp(temp_c)
-    if FAN_AUTO_SENT_AS_MODE_TEMP_ONLY and fan == 6:
-        return _build_ext_pairs([(mode_code, t), (0x41, 0x00)])
-    code = FAN_CODE.get(fan, 0x32)
-    return _build_ext_pairs([(mode_code, t), (code, 0x00)])
+    f = _fan_code_or_auto(fan)
+    return _build_ext_pairs([(code, t), (f, other & 0xFF)])
 
 
 def _parse_0x90_frames(stream):
@@ -126,6 +130,18 @@ def _parse_0x90_frames(stream):
     return out
 
 
+def _parse_single_event_frame(fr):
+    if len(fr) < 10 or fr[:4] != b"\x02\x00\x03\x11":
+        return None
+    ln = fr[6]
+    total = 7 + ln + 1
+    if total != len(fr):
+        return None
+    sid, val, chk = fr[-3], fr[-2], fr[-1]
+    ok = ((sum(fr[:-1]) + chk) & 0xFF) == 0x02
+    return sid, val, ok
+
+
 def _build_ack_91():
     body = bytes(
         [0x02, 0x00, 0x03, 0x91, 0x01, 0x00, 0x05, 0x00, 0x00, 0x01, 0x30, 0x01]
@@ -144,8 +160,10 @@ class ToshibaCN22Driver:
         self._handshaked = False
         self._missed_keepalive = 0
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._recovering = False
+        self._no_response_count = 0
         self._busy = False
-        self._event_polling = False
         self.debug = int(debug)  # 0: off, 1: basic, 2: hex
         self.log = Logger("cn22-driver")
 
@@ -229,71 +247,119 @@ class ToshibaCN22Driver:
             await asyncio.sleep_ms(4)
 
     async def _send(
-        self, label, frame, wait_ms=WAIT_RX_MS, gap_ms=GAP_SHORT_MS, verbose=False
+        self,
+        label,
+        frame,
+        wait_ms=WAIT_RX_MS,
+        gap_ms=GAP_SHORT_MS,
+        verbose=False,
+        track_no_response=True,
     ):
-        self._busy = True
-        try:
-            # drain any pending RX
+        rsp = b""
+        async with self._send_lock:
+            self._busy = True
             try:
-                while True:
-                    d = self.uart.read()
-                    if not d:
-                        break
-            except Exception as e:
+                # drain any pending RX
+                try:
+                    while True:
+                        d = self.uart.read()
+                        if not d:
+                            break
+                except Exception as e:
+                    if self.debug >= 1:
+                        self.log.debug(f"UART drain error: {e}")
+
+                idle_ok = await self._wait_idle(30, 1200)
                 if self.debug >= 1:
-                    self.log.debug(f"UART drain error: {e}")
+                    self.log.debug(f"TX {label} len={len(frame)} idle_ok={idle_ok}")
+                    if self.debug >= 2:
+                        self.log.debug("TX hex: " + self._hex(frame))
 
-            idle_ok = await self._wait_idle(30, 1200)
+                self.uart.write(frame)
+                rsp = await self._rx_collect(wait_ms)
+
+                if self.debug >= 1:
+                    if rsp:
+                        self.log.debug(f"RX {label} len={len(rsp)}")
+                    else:
+                        self.log.debug(f"RX {label}: <no response>")
+
+                await asyncio.sleep_ms(gap_ms)
+                self._reflect_stream(rsp)
+            finally:
+                self._busy = False
+        if track_no_response and wait_ms > 0:
+            if rsp:
+                self._no_response_count = 0
+            else:
+                self._no_response_count += 1
+                if self._no_response_count >= NO_RESPONSE_RECOVER:
+                    self._no_response_count = 0
+                    await self._recover_session()
+        return rsp
+
+    async def _write_frame(self, label, frame):
+        async with self._send_lock:
+            self._busy = True
+            try:
+                if self.debug >= 1:
+                    self.log.debug(f"TX {label} len={len(frame)} (write-only)")
+                    if self.debug >= 2:
+                        self.log.debug("TX hex: " + self._hex(frame))
+                self.uart.write(frame)
+            finally:
+                self._busy = False
+
+    async def _recover_session(self):
+        if self._recovering:
+            return
+        self._recovering = True
+        try:
+            self.log.warning(
+                f"No response {NO_RESPONSE_RECOVER}x -> re-handshake in {NO_RESPONSE_RECOVER_DELAY_MS} ms"
+            )
+            self._handshaked = False
+            await asyncio.sleep_ms(NO_RESPONSE_RECOVER_DELAY_MS)
             if self.debug >= 1:
-                self.log.debug(f"TX {label} len={len(frame)} idle_ok={idle_ok}")
-                if self.debug >= 2:
-                    self.log.debug("TX hex: " + self._hex(frame))
-
-            self.uart.write(frame)
-            rsp = await self._rx_collect(wait_ms)
-
-            if self.debug >= 1:
-                if rsp:
-                    self.log.debug(f"RX {label} len={len(rsp)}")
-                else:
-                    self.log.debug(f"RX {label}: <no response>")
-
-            await asyncio.sleep_ms(gap_ms)
-            self._reflect_stream(rsp)
-            return rsp
+                self.log.debug("Re-handshake starting now")
+            await self.handshake()
         finally:
-            self._busy = False
+            self._recovering = False
 
     # ---- session maintenance ----
     async def _handshake_once(self, per_step_retries=2):
         """Run one handshake sequence. Returns (any_reply: bool, missed_labels: list[str])."""
         steps = [
-            ("HS0", HS[0], GAP_NORMAL_MS),
-            ("HS1", HS[1], GAP_SHORT_MS),
-            ("HS2", HS[2], GAP_NORMAL_MS),
-            ("HS3", HS[3], GAP_SHORT_MS),
-            ("HS4", HS[4], GAP_SHORT_MS),
-            ("HS5", HS[5], GAP_NORMAL_MS),
-            ("AF0", AFTER_HS[0], GAP_SHORT_MS),
-            ("AF1", AFTER_HS[1], GAP_NORMAL_MS),
+            ("HS0", HS[0], GAP_NORMAL_MS, WAIT_RX_MS, False),
+            ("HS1", HS[1], GAP_SHORT_MS, WAIT_RX_MS, False),
+            ("HS2", HS[2], GAP_NORMAL_MS, WAIT_RX_MS, False),
+            ("HS3", HS[3], GAP_SHORT_MS, 0, True),
+            ("HS4", HS[4], GAP_SHORT_MS, WAIT_RX_MS, False),
+            ("HS5", HS[5], GAP_NORMAL_MS, WAIT_RX_MS, False),
+            ("AF0", AFTER_HS[0], GAP_SHORT_MS, WAIT_RX_MS, False),
+            ("AF1", AFTER_HS[1], GAP_NORMAL_MS, WAIT_RX_MS, False),
         ]
         any_reply = False
         missed = []
-        for label, frame, gap in steps:
+        for label, frame, gap, wait_ms, allow_no_response in steps:
             rsp = None
             for _ in range(per_step_retries):
                 rsp = await self._send(
                     label,
                     frame,
-                    wait_ms=WAIT_RX_MS,
+                    wait_ms=wait_ms,
                     gap_ms=gap,
                     verbose=(self.debug >= 1),
+                    track_no_response=False,
                 )
                 if rsp:
                     any_reply = True
                     break
+                if allow_no_response:
+                    rsp = b""
+                    break
                 await asyncio.sleep_ms(80)  # small spacing between retries
-            if not rsp:
+            if not rsp and not allow_no_response:
                 missed.append(label)
         return any_reply, missed
 
@@ -355,6 +421,7 @@ class ToshibaCN22Driver:
                         wait_ms=300,
                         gap_ms=GAP_SHORT_MS,
                         verbose=(self.debug >= 1),
+                        track_no_response=False,
                     )
                     if rsp:
                         ok = True
@@ -392,12 +459,19 @@ class ToshibaCN22Driver:
                 self.model.fanmode = FAN_CODE_REV[val]
             elif 0 <= val <= 6:
                 self.model.fanmode = val
+        elif sid == 0xA3:
+            self.model.swing = 1 if val == VAL_SWING_ON else 0
+        elif sid == 0x87:
+            self.model.p_select = int(val)
         elif sid == 0x41:
             self.model.setpoint_x10 = int(val) * 10
         elif sid == 0xBB:
             self.model.roomtemp_x10 = int(val) * 10
         elif sid == 0xBE:
-            self.model.outdoor_x10 = int(val) * 10
+            v = int(val)
+            if v > 128:
+                v -= 256
+            self.model.outdoor_x10 = v * 10
 
     def _reflect_stream(self, rsp):
         if not rsp:
@@ -413,6 +487,22 @@ class ToshibaCN22Driver:
                     "reflect: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val)
                 )
 
+    def _reflect_event_frame(self, fr):
+        parsed = _parse_single_event_frame(fr)
+        if not parsed:
+            return
+        sid, val, ok = parsed
+        if ok:
+            if self.debug >= 1:
+                self.log.debug(
+                    "reflect_event SID=0x%02X VAL=0x%02X" % (sid, val)
+                )
+            self._reflect_sid_val(sid, val)
+        elif self.debug >= 1:
+            self.log.debug(
+                "reflect_event: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val)
+            )
+
     # ---- quick helper: get current mode_code (read if unknown) ----
     async def _get_current_mode_code(self):
         cur_mode = getattr(self.model, "mode", None)
@@ -424,6 +514,7 @@ class ToshibaCN22Driver:
                 _build_read(0xB0),
                 wait_ms=POLL_WAIT_MS,
                 gap_ms=GAP_SHORT_MS,
+                track_no_response=False,
             )
             for sid, val, ok in _parse_0x90_frames(rsp):
                 if ok and sid == 0xB0:
@@ -440,7 +531,7 @@ class ToshibaCN22Driver:
 
     # ---- polling task ----
     async def poll_task(self, every_ms=2000):
-        _POLL_SIDS = (0x80, 0xB0, 0x90, 0xBB, 0xBE)
+        _POLL_SIDS = (0x80, 0xB0, 0x90, 0xA3, 0x87, 0xBB, 0xBE)  # power/mode/fan/swing/p-select/temps
         while True:
             try:
                 if not self._handshaked:
@@ -454,6 +545,7 @@ class ToshibaCN22Driver:
                         _build_read(sid),
                         wait_ms=POLL_WAIT_MS,
                         verbose=(self.debug >= 1),
+                        track_no_response=False,
                     )
                 await asyncio.sleep_ms(every_ms)
             except Exception as e:
@@ -480,25 +572,6 @@ class ToshibaCN22Driver:
         elif len(buf) > 1024:
             buf[:] = buf[-64:]
         return frames
-
-    async def _burst_poll(self):
-        if self._event_polling:
-            return
-        self._event_polling = True
-        try:
-            for sid in (0x41, 0x80, 0xB0, 0x90, 0xBB, 0xBE):
-                if self.debug >= 1:
-                    self.log.debug("burst_poll: READ 0x%02X" % sid)
-                await self._send(
-                    f"EVT_READ{sid:02X}",
-                    _build_read(sid),
-                    wait_ms=POLL_WAIT_MS,
-                    verbose=(self.debug >= 1),
-                )
-                await asyncio.sleep_ms(20)
-        finally:
-            await asyncio.sleep_ms(200)
-            self._event_polling = False
 
     async def event_watch_task(self):
         buf = bytearray()
@@ -535,26 +608,80 @@ class ToshibaCN22Driver:
                             try:
                                 if self.debug >= 1:
                                     self.log.debug(
-                                        "EVT: 0x11 -> send 0x91 ACK + burst_poll"
+                                        "EVT: 0x11 -> reflect + send 0x91 ACK"
                                     )
-                                self.uart.write(_build_ack_91())
+                                self._reflect_event_frame(fr)
+                                await self._write_frame("ACK_91", _build_ack_91())
                             except Exception as e:
                                 self.log.error(f"ACK 0x91 write error: {e}")
-                            asyncio.create_task(self._burst_poll())
                 await asyncio.sleep_ms(2)
             except Exception as e:
                 self.log.error(f"event_watch_task error: {e}")
                 await asyncio.sleep_ms(200)
 
     # ==================== PUBLIC API ====================
+    async def set_settings(self, mode, fan, setpoint_x10, other=0x00):
+        m0 = int(mode) if mode is not None else 0
+        f0 = int(fan) if fan is not None else 6
+        if other is None:
+            other = getattr(self.model, "other", VAL_OTHER_OFF)
+        other = int(other) & 0xFF
+        m = 0 if m0 < 0 else 4 if m0 > 4 else m0
+        f = 0 if f0 < 0 else 6 if f0 > 6 else f0
+        t = _clamp_temp(setpoint_x10 // 10)
+        if not self._handshaked:
+            await self.handshake()
+        await self._send(
+            f"SET_ALL(m={m} f={f} t={t})",
+            _build_set_all_ext(t, m, f, other),
+            wait_ms=800,
+            gap_ms=GAP_NORMAL_MS,
+            verbose=(self.debug >= 1),
+        )
+        self.model.mode = m
+        self.model.fanmode = f
+        self.model.setpoint_x10 = t * 10
+        if other is not None:
+            self.model.other = other
+
+    async def set_other(self, other):
+        if not self._handshaked:
+            await self.handshake()
+        cur_mode = getattr(self.model, "mode", None)
+        cur_fan = getattr(self.model, "fanmode", None)
+        cur_sp = getattr(self.model, "setpoint_x10", 220)
+        await self.set_settings(cur_mode, cur_fan, cur_sp, other=other)
+
+    async def set_p_select(self, val):
+        if not self._handshaked:
+            await self.handshake()
+        v = int(val) & 0xFF
+        await self._send(
+            f"P_SELECT({v})",
+            _build_simple(CMD_P_SELECT, v),
+            wait_ms=800,
+            gap_ms=GAP_NORMAL_MS,
+            verbose=(self.debug >= 1),
+        )
+        self.model.p_select = v
+
     async def set_setpoint_x10(self, sp_x10):
         t = _clamp_temp(sp_x10 // 10)
         if not self._handshaked:
             await self.handshake()
-        mode_code = await self._get_current_mode_code()
+        cur_mode = getattr(self.model, "mode", None)
+        mode = int(cur_mode) if cur_mode is not None else None
+        if mode is None or not (0 <= mode <= 4):
+            mode_code = await self._get_current_mode_code()
+            mode = MODE_CODE_REV.get(mode_code, 0)
+        cur_fan = getattr(self.model, "fanmode", None)
+        fan = int(cur_fan) if cur_fan is not None else 6
+        if not (0 <= fan <= 6):
+            fan = 6
+        other = getattr(self.model, "other", VAL_OTHER_OFF)
         await self._send(
             f"SET_TEMP({t}) keep-mode",
-            _build_set_temp_keep_mode(t, mode_code),
+            _build_set_all_ext(t, mode, fan, other),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
@@ -581,10 +708,20 @@ class ToshibaCN22Driver:
                 verbose=(self.debug >= 1),
             )
             temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
-            mode_code = await self._get_current_mode_code()
+            cur_mode = getattr(self.model, "mode", None)
+            if cur_mode is not None and 0 <= int(cur_mode) <= 4:
+                mode = int(cur_mode)
+            else:
+                mode_code = await self._get_current_mode_code()
+                mode = MODE_CODE_REV.get(mode_code, 0)
+            cur_fan = getattr(self.model, "fanmode", None)
+            fan = int(cur_fan) if cur_fan is not None else 6
+            if not (0 <= fan <= 6):
+                fan = 6
+            other = getattr(self.model, "other", VAL_OTHER_OFF)
             await self._send(
                 "SET_TEMP keep-mode after OFF",
-                _build_set_temp_keep_mode(temp_c, mode_code),
+                _build_set_all_ext(temp_c, mode, fan, other),
                 wait_ms=800,
                 gap_ms=GAP_NORMAL_MS,
                 verbose=(self.debug >= 1),
@@ -596,9 +733,14 @@ class ToshibaCN22Driver:
         if not self._handshaked:
             await self.handshake()
         temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
+        cur_fan = getattr(self.model, "fanmode", None)
+        fan = int(cur_fan) if cur_fan is not None else 6
+        if not (0 <= fan <= 6):
+            fan = 6
+        other = getattr(self.model, "other", VAL_OTHER_OFF)
         await self._send(
             f"MODE_EXT({m})",
-            _build_set_mode_ext(temp_c, m),
+            _build_set_all_ext(temp_c, m, fan, other),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
@@ -611,14 +753,15 @@ class ToshibaCN22Driver:
             await self.handshake()
         temp_c = _clamp_temp(self.model.setpoint_x10 // 10)
         cur_mode = getattr(self.model, "mode", None)
-        mode_code = (
-            MODE_CODE.get(int(cur_mode), 0x41)
-            if cur_mode is not None
-            else await self._get_current_mode_code()
-        )
+        if cur_mode is not None and 0 <= int(cur_mode) <= 4:
+            mode = int(cur_mode)
+        else:
+            mode_code = await self._get_current_mode_code()
+            mode = MODE_CODE_REV.get(mode_code, 0)
+        other = getattr(self.model, "other", VAL_OTHER_OFF)
         await self._send(
             f"FAN_EXT({f})",
-            _build_set_fan_ext_with_mode(temp_c, f, mode_code),
+            _build_set_all_ext(temp_c, mode, f, other),
             wait_ms=800,
             gap_ms=GAP_NORMAL_MS,
             verbose=(self.debug >= 1),
