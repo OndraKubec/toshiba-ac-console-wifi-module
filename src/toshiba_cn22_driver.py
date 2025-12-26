@@ -142,6 +142,27 @@ def _parse_single_event_frame(fr):
     return sid, val, ok
 
 
+def _parse_0x11_frames(stream):
+    out = []
+    if not stream:
+        return out
+    i, n = 0, len(stream)
+    while i + 8 <= n:
+        if stream[i : i + 4] != b"\x02\x00\x03\x11":
+            i += 1
+            continue
+        ln = stream[i + 6]
+        total = 7 + ln + 1
+        if i + total > n:
+            break
+        fr = stream[i : i + total]
+        parsed = _parse_single_event_frame(fr)
+        if parsed:
+            out.append(parsed)
+        i += total
+    return out
+
+
 def _build_ack_91():
     body = bytes(
         [0x02, 0x00, 0x03, 0x91, 0x01, 0x00, 0x05, 0x00, 0x00, 0x01, 0x30, 0x01]
@@ -459,10 +480,19 @@ class ToshibaCN22Driver:
                 self.model.fanmode = FAN_CODE_REV[val]
             elif 0 <= val <= 6:
                 self.model.fanmode = val
+        elif sid == 0xA0:
+            if val == 0x41:
+                self.model.fanmode = 6
+            elif val in FAN_CODE_REV:
+                self.model.fanmode = FAN_CODE_REV[val]
+        elif sid == 0xB3:
+            self.model.setpoint_x10 = int(val) * 10
         elif sid == 0xA3:
             self.model.swing = 1 if val == VAL_SWING_ON else 0
         elif sid == 0x87:
             self.model.p_select = int(val)
+        elif sid == 0xF7:
+            self.model.other = int(val)
         elif sid == 0x41:
             self.model.setpoint_x10 = int(val) * 10
         elif sid == 0xBB:
@@ -485,6 +515,16 @@ class ToshibaCN22Driver:
             elif self.debug >= 1:
                 self.log.debug(
                     "reflect: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val)
+                )
+        evt_frames = _parse_0x11_frames(rsp)
+        if evt_frames and self.debug >= 1:
+            self.log.debug(f"reflect_stream: {len(evt_frames)} x 0x11 frames")
+        for sid, val, ok in evt_frames:
+            if ok:
+                self._reflect_sid_val(sid, val)
+            elif self.debug >= 1:
+                self.log.debug(
+                    "reflect_evt: BAD CHK for SID=0x%02X VAL=0x%02X" % (sid, val)
                 )
 
     def _reflect_event_frame(self, fr):
@@ -535,6 +575,9 @@ class ToshibaCN22Driver:
         while True:
             try:
                 if not self._handshaked:
+                    if self.debug >= 1:
+                        self.log.debug("poll: not handshaked -> handshake()")
+                    await self.handshake()
                     await asyncio.sleep_ms(250)
                     continue
                 for sid in _POLL_SIDS:

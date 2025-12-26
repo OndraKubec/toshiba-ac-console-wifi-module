@@ -24,7 +24,7 @@ async def main():
 
     # Model + driver (driver logs handshake/traffic when debug enabled)
     model = ACModel(driver=None)
-    driver = ToshibaCN22Driver(model, debug=2)
+    driver = ToshibaCN22Driver(model)
     model.driver = driver
 
     # CN22 handshake

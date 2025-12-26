@@ -135,6 +135,9 @@ Requests and responses used in this project:
 -   Event notification (0x11): device event; we reply with 0x91 ACK.
     Model is updated directly from the event payload; periodic polling is the fallback.
 -   Polling reads SIDs: 0x80, 0xB0, 0x90, 0xA3, 0x87, 0xBB, 0xBE.
+-   Event SIDs seen from OEM module: 0xB3 (setpoint), 0xA0 (fan), 0xF7 (other).
+-   Incoming setpoint values from the unit are accepted as-is; only outgoing writes are clamped to 20–30 °C.
+-   Poll task will auto-handshake when `_handshaked` is false.
 -   Session recovery: if write commands get no response twice in a row, the driver waits 2s and re-handshakes.
 -   Handshake note: HS3 is sent without waiting for a response (none is typically observed).
 
